@@ -8,8 +8,8 @@ pandas==2.1.3
 numpy==1.26.2
 yfinance==0.2.33
 
-# Machine Learning
-tensorflow==2.15.0
+# Machine Learning (compatible con Python 3.12)
+tensorflow==2.16.1
 scikit-learn==1.3.2
 
 # Utilities
