@@ -2,6 +2,7 @@
 Rutas de la API para optimización de portafolios.
 """
 import time
+import numpy as np
 from fastapi import APIRouter, HTTPException
 
 from app.models.schemas import (
@@ -14,9 +15,7 @@ from app.models.schemas import (
     ErrorResponse
 )
 from app.services.data_service import data_service
-from app.services.lstm_service import lstm_service
 from app.services.montecarlo_service import montecarlo_service
-from app.services.optimizer_service import optimizer_service
 
 router = APIRouter(prefix="/portfolio", tags=["Portfolio"])
 
@@ -44,11 +43,20 @@ async def analyze_portfolio(request: AnalyzeRequest):
     start_time = time.time()
 
     try:
-        # 1. Resolver tickers
-        tickers = [
-            data_service.resolver_ticker(t.strip())
-            for t in request.tickers
-        ]
+        # 1. Resolver tickers - Convertir nombres a tickers
+        if isinstance(request.tickers, str):
+            tickers = data_service.buscar_tickers(request.tickers)
+        else:
+            tickers = [
+                data_service.resolver_ticker(t.strip())
+                for t in request.tickers
+            ]
+
+        if len(tickers) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Se requieren al menos 2 activos válidos."
+            )
 
         # 2. Descargar datos
         df_precios, df_rendimientos = data_service.descargar_datos(tickers)
@@ -60,8 +68,33 @@ async def analyze_portfolio(request: AnalyzeRequest):
             )
 
         # 3. Preparar datos y entrenar/cargar modelo
-        datos = lstm_service.preparar_datos(df_rendimientos)
-        modelo = lstm_service.entrenar_modelo(datos)
+        X, Y = data_service.preparar_secuencias(df_rendimientos)
+        
+        # Dividir datos en train/test
+        div = int(len(X) * 0.8)
+        X_train, X_test = X[:div], X[div:]
+        Y_train, Y_test = Y[:div], Y[div:]
+
+        n_features = df_rendimientos.shape[1]
+        
+        # Inicializar servicio LSTM con número de features
+        from app.services.lstm_service import LSTMService
+        lstm_srv = LSTMService(n_features=n_features)
+
+        # Preparar datos en diccionario
+        datos = {
+            "X_train": X_train,
+            "Y_train": Y_train,
+            "X_test": X_test,
+            "Y_test": Y_test,
+            "scaler": data_service.scaler,
+            "n_features": n_features,
+            "names": df_rendimientos.columns.tolist(),
+            "df_rend": df_rendimientos,
+            "index_test": len(df_rendimientos) - len(X) + div
+        }
+
+        modelo = lstm_srv.entrenar_modelo(datos)
 
         if modelo is None:
             raise HTTPException(
@@ -69,24 +102,38 @@ async def analyze_portfolio(request: AnalyzeRequest):
                 detail="Error al cargar o entrenar el modelo LSTM."
             )
 
-        # 4. Simulación Monte Carlo
+        # 4. Predicción del próximo rendimiento esperado
+        prediccion_scaled = lstm_srv.predecir_futuro(X_test[-1])
+        prediccion_real = data_service.scaler.inverse_transform(
+            prediccion_scaled.reshape(1, -1)
+        )[0]
+
+        # 5. Optimización usando scipy.optimize
         ultimos_precios = df_precios.iloc[-1].values
+        sharpe, pesos_optimos = montecarlo_service.optimizar_cartera(
+            df_rendimientos, prediccion_real, datos["names"]
+        )
+
+        # 6. Stress test Monte Carlo con VaR
         rend_inv, precios_sim, mu, sigma = montecarlo_service.proyectar_y_simular(
             modelo, datos, ultimos_precios
         )
-
-        # 5. Optimización
-        sharpe, pesos_optimos = optimizer_service.optimizar_portafolio(
-            precios_sim, datos["names"]
+        var_95 = montecarlo_service.stress_test_monte_carlo(
+            precios_sim, np.array(list(pesos_optimos.values()))
         )
 
-        # 6. Validación
-        metricas = lstm_service.calcular_metricas_validacion(datos, pesos_optimos)
+        # 7. Validación del modelo
+        metricas = lstm_srv.calcular_metricas_validacion(datos, pesos_optimos)
 
-        # 7. Formatear respuesta
-        parametros = montecarlo_service.obtener_parametros_proyectados(
-            datos["names"], mu, sigma
-        )
+        # 8. Preparar parámetros proyectados
+        parametros = [
+            {
+                "ticker": datos["names"][i],
+                "drift_anual": float(mu[i] * 100),
+                "volatilidad_anual": float(sigma[i] * 100)
+            }
+            for i in range(len(datos["names"]))
+        ]
 
         tiempo_total = time.time() - start_time
 
@@ -103,7 +150,7 @@ async def analyze_portfolio(request: AnalyzeRequest):
                 ganancia_vs_buy_hold=metricas["ganancia_vs_buy_hold"]
             ),
             tiempo_ejecucion=tiempo_total,
-            mensaje=f"Análisis completado para {len(datos['names'])} activos."
+            mensaje=f"Análisis completado para {len(datos['names'])} activos. VaR 95%: {var_95*100:.2f}%"
         )
 
     except HTTPException:
