@@ -141,6 +141,7 @@ async def analyze_portfolio(request: AnalyzeRequest):
             success=True,
             pesos_optimos=pesos_optimos,
             sharpe_ratio=float(sharpe),
+            var_95=float(var_95),
             parametros_proyectados=[
                 ParametrosProyectados(**p) for p in parametros
             ],
@@ -150,7 +151,7 @@ async def analyze_portfolio(request: AnalyzeRequest):
                 ganancia_vs_buy_hold=metricas["ganancia_vs_buy_hold"]
             ),
             tiempo_ejecucion=tiempo_total,
-            mensaje=f"Análisis completado para {len(datos['names'])} activos. VaR 95%: {var_95*100:.2f}%"
+            mensaje=f"Análisis completado para {len(datos['names'])} activos."
         )
 
     except HTTPException:

@@ -62,6 +62,10 @@ class AnalyzeResponse(BaseModel):
         description="Distribución óptima de pesos por ticker (0-1)"
     )
     sharpe_ratio: float
+    var_95: float = Field(
+        ...,
+        description="Value at Risk 95% - pérdida máxima esperada con 95% de confianza"
+    )
     parametros_proyectados: List[ParametrosProyectados]
     metricas_validacion: MetricasValidacion
     tiempo_ejecucion: float = Field(..., description="Tiempo de ejecución en segundos")
