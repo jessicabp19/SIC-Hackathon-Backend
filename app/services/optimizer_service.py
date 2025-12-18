@@ -1,10 +1,13 @@
 """
 Servicio de Optimización: búsqueda de pesos óptimos de cartera.
+Utiliza simulación de Monte Carlo o scipy.optimize para encontrar pesos óptimos.
 """
 import numpy as np
+import pandas as pd
 from typing import Dict, List, Tuple
+from scipy.optimize import minimize
 
-from app.config import N_SIMULACIONES
+from app.config import N_SIMULACIONES, DIAS_TRADING_ANUALES
 
 
 class OptimizerService:
@@ -61,6 +64,64 @@ class OptimizerService:
         }
 
         return mejor_sharpe, pesos_dict
+
+    def optimizar_portafolio_scipy(
+        self,
+        df_rendimientos: pd.DataFrame,
+        predicciones_ia: np.ndarray,
+        nombres: List[str]
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        Optimización determinista usando scipy.optimize.minimize.
+        Maximiza el Sharpe Ratio basándose en rendimientos predichos y covarianza histórica.
+
+        Args:
+            df_rendimientos: DataFrame con rendimientos logarítmicos históricos
+            predicciones_ia: Array con rendimientos predichos por LSTM
+            nombres: Lista de nombres/tickers de activos
+
+        Returns:
+            Tuple de (mejor_sharpe_ratio, diccionario_pesos_optimos)
+        """
+        cov_matrix = (df_rendimientos.cov() * DIAS_TRADING_ANUALES).values
+        rend_esperados = predicciones_ia * DIAS_TRADING_ANUALES
+        n_activos = len(nombres)
+
+        def objetivo(weights):
+            retorno_p = np.sum(rend_esperados * weights)
+            vol_p = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+            sharpe = retorno_p / (vol_p + 1e-9)
+            # Penalización para distribución más suave
+            penalizacion_estabilidad = 0.001 * np.sum(weights**2)
+            return -(sharpe - penalizacion_estabilidad)
+
+        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+        bounds = tuple((0.02, 0.45) for _ in range(n_activos))
+        iniciales = np.array([1. / n_activos] * n_activos)
+
+        resultado = minimize(
+            objetivo,
+            iniciales,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints,
+            tol=1e-12
+        )
+
+        pesos_optimos = resultado.x if resultado.success else iniciales
+
+        # Convertir a diccionario
+        pesos_dict = {
+            nombre: float(peso)
+            for nombre, peso in zip(nombres, pesos_optimos)
+        }
+
+        # Calcular Sharpe ratio final
+        retorno_final = np.sum(rend_esperados * pesos_optimos)
+        vol_final = np.sqrt(np.dot(pesos_optimos.T, np.dot(cov_matrix, pesos_optimos)))
+        sharpe_final = retorno_final / (vol_final + 1e-9)
+
+        return sharpe_final, pesos_dict
 
     def formatear_pesos_porcentaje(
         self,

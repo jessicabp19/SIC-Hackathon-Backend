@@ -17,6 +17,7 @@ from app.config import (
     TAMANO_VENTANA,
     PROPORCION_ENTRENAMIENTO,
     EPOCAS_NN,
+    EPOCAS_INCREMENTAL,
     TAMANO_LOTE_NN,
     UNIDADES_LSTM,
     NOMBRE_ARCHIVO_MODELO
@@ -26,7 +27,8 @@ from app.config import (
 class LSTMService:
     """Servicio para el modelo LSTM de predicción de rendimientos."""
 
-    def __init__(self):
+    def __init__(self, n_features: int = 1):
+        self.n_features = n_features
         self._modelo: Optional[Sequential] = None
         self._cargar_modelo_existente()
 
@@ -34,8 +36,14 @@ class LSTMService:
         """Intenta cargar un modelo previamente entrenado."""
         if os.path.exists(NOMBRE_ARCHIVO_MODELO):
             try:
-                self._modelo = load_model(NOMBRE_ARCHIVO_MODELO)
-                print(f"Modelo LSTM cargado: {NOMBRE_ARCHIVO_MODELO}")
+                model = load_model(NOMBRE_ARCHIVO_MODELO)
+                # Verificar si el modelo es compatible con el número de features
+                if model.input_shape[2] == self.n_features:
+                    self._modelo = model
+                    print(f"Modelo LSTM cargado exitosamente para {self.n_features} activos.")
+                else:
+                    print(f"El número de activos cambió. Se requiere un nuevo modelo.")
+                    self._modelo = None
             except Exception as e:
                 print(f"Error al cargar modelo: {e}")
                 self._modelo = None
@@ -77,6 +85,7 @@ class LSTMService:
     def entrenar_modelo(self, datos: Dict[str, Any]) -> Sequential:
         """
         Entrena el modelo LSTM o usa uno existente si es compatible.
+        Soporta aprendizaje incremental si ya existe un modelo.
 
         Args:
             datos: Diccionario con datos preparados
@@ -90,32 +99,46 @@ class LSTMService:
         if self._modelo is not None:
             try:
                 if self._modelo.input_shape[2] == n_features:
-                    return self._modelo
+                    # Modelo compatible, usar aprendizaje incremental
+                    is_incremental = True
+                else:
+                    # Incompatible, crear nuevo
+                    self._modelo = None
+                    is_incremental = False
             except:
-                pass
+                is_incremental = False
+        else:
+            is_incremental = False
 
-        print("Iniciando entrenamiento del modelo LSTM...")
+        # Determinar épocas según modo
+        epocas = EPOCAS_INCREMENTAL if is_incremental else EPOCAS_NN
+        modo = "Incremental" if is_incremental else "Completo"
 
-        model = Sequential([
-            LSTM(UNIDADES_LSTM, input_shape=(TAMANO_VENTANA, n_features)),
-            Dropout(0.2),
-            Dense(n_features)
-        ])
-        model.compile(optimizer="adam", loss="mse")
+        print(f"Iniciando modo {modo} ({epocas} épocas)...")
+
+        # Si no hay modelo, crear nueva arquitectura
+        if self._modelo is None:
+            print("Construyendo nueva arquitectura LSTM...")
+            self._modelo = Sequential([
+                LSTM(UNIDADES_LSTM, input_shape=(TAMANO_VENTANA, n_features), return_sequences=False),
+                Dropout(0.2),
+                Dense(n_features)
+            ])
+            self._modelo.compile(optimizer="adam", loss="mse")
 
         callbacks = [
             EarlyStopping(
                 monitor="val_loss",
-                patience=8,
+                patience=5,
                 restore_best_weights=True
             )
         ]
 
-        model.fit(
+        self._modelo.fit(
             datos["X_train"],
             datos["Y_train"],
             validation_data=(datos["X_test"], datos["Y_test"]),
-            epochs=EPOCAS_NN,
+            epochs=epocas,
             batch_size=TAMANO_LOTE_NN,
             verbose=0,
             callbacks=callbacks
@@ -123,17 +146,33 @@ class LSTMService:
 
         # Guardar modelo entrenado
         try:
-            model.save(NOMBRE_ARCHIVO_MODELO)
-            print(f"Modelo guardado: {NOMBRE_ARCHIVO_MODELO}")
+            self._modelo.save(NOMBRE_ARCHIVO_MODELO)
+            print(f"Conocimiento actualizado y guardado: {NOMBRE_ARCHIVO_MODELO}")
         except Exception as e:
             print(f"Error al guardar modelo: {e}")
 
-        self._modelo = model
-        return model
+        return self._modelo
 
     def obtener_modelo(self) -> Optional[Sequential]:
         """Retorna el modelo actual (puede ser None)."""
         return self._modelo
+
+    def predecir_futuro(self, ultima_ventana: np.ndarray) -> np.ndarray:
+        """
+        Toma los últimos 60 días y proyecta el siguiente rendimiento esperado.
+
+        Args:
+            ultima_ventana: Array de forma (TAMANO_VENTANA, n_features)
+
+        Returns:
+            Array de rendimientos predichos (escalados)
+        """
+        if self._modelo is None:
+            raise ValueError("No hay modelo disponible para predicción")
+
+        input_data = ultima_ventana.reshape(1, TAMANO_VENTANA, self.n_features)
+        prediccion = self._modelo.predict(input_data, verbose=0)
+        return prediccion[0]  # Rendimientos esperados
 
     def calcular_metricas_validacion(
         self,

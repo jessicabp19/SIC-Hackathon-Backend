@@ -7,6 +7,7 @@ import numpy as np
 import yfinance as yf
 import requests
 from fuzzywuzzy import process
+from sklearn.preprocessing import MinMaxScaler
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 
@@ -37,6 +38,7 @@ class DataService:
     def __init__(self):
         self._sp500_cache: Optional[Dict[str, str]] = None
         self._nombres_sp500: List[str] = []
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
 
     def obtener_sp500(self) -> Dict[str, str]:
         """
@@ -91,6 +93,28 @@ class DataService:
             for match in matches
             if match[1] > 50
         ]
+
+    def buscar_tickers(self, entrada_usuario: str) -> List[str]:
+        """
+        Convierte nombres comunes en tickers oficiales.
+        Recibe una cadena con nombres separados por coma.
+        """
+        sp500 = self.obtener_sp500()
+        nombres = [n.strip() for n in entrada_usuario.split(",") if n.strip()]
+        tickers_finales = []
+        
+        for nombre in nombres:
+            if nombre.upper() in sp500.values():
+                tickers_finales.append(nombre.upper())
+            else:
+                # Búsqueda para corregir errores ortográficos
+                if self._nombres_sp500:
+                    match, score = process.extractOne(nombre, self._nombres_sp500)
+                    tickers_finales.append(sp500.get(match, nombre.upper()))
+                else:
+                    tickers_finales.append(nombre.upper())
+        
+        return list(set(tickers_finales))
 
     def resolver_ticker(self, entrada: str) -> str:
         """
@@ -203,6 +227,26 @@ class DataService:
         except Exception as e:
             print(f"Error descargando datos: {e} - usando datos mock como fallback")
             return self._generar_datos_mock(lista_tickers)
+
+    def preparar_secuencias(self, df_rend: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Prepara ventanas X y objetivos Y para entrenamiento del LSTM.
+        Utiliza el scaler del servicio para normalizar datos.
+
+        Args:
+            df_rend: DataFrame con rendimientos logarítmicos
+
+        Returns:
+            Tuple de (X, Y) arrays para entrenamiento
+        """
+        scaled_data = self.scaler.fit_transform(df_rend.values)
+
+        X, Y = [], []
+        for i in range(TAMANO_VENTANA, len(scaled_data)):
+            X.append(scaled_data[i - TAMANO_VENTANA:i])
+            Y.append(scaled_data[i])
+
+        return np.array(X), np.array(Y)
 
 
 # Instancia singleton del servicio

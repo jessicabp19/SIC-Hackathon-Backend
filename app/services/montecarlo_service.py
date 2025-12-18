@@ -1,8 +1,10 @@
 """
-Servicio Monte Carlo: simulación de trayectorias de precios.
+Servicio Monte Carlo: simulación de trayectorias de precios y optimización de cartera.
 """
 import numpy as np
+import pandas as pd
 from typing import Dict, Any, Tuple, List
+from scipy.optimize import minimize
 
 from tensorflow.keras.models import Sequential
 
@@ -40,7 +42,7 @@ class MonteCarloService:
         scaler = datos["scaler"]
         ventana = datos["X_test"][-1].copy()
 
-        # Proyección LSTM
+        # Proyección LSTM iterativa
         forecast_scaled = []
         for _ in range(DIAS_PROYECCION):
             pred = modelo.predict(
@@ -99,31 +101,104 @@ class MonteCarloService:
 
         return precios
 
-    def obtener_parametros_proyectados(
-        self,
-        nombres: List[str],
-        mu: np.ndarray,
-        sigma: np.ndarray
-    ) -> List[Dict[str, Any]]:
+    def calcular_matriz_covarianza(self, df_rendimientos: pd.DataFrame) -> pd.DataFrame:
         """
-        Formatea los parámetros proyectados para la respuesta.
+        Calcula la matriz de covarianza anualizada de los rendimientos históricos.
 
         Args:
-            nombres: Lista de nombres/tickers de activos
-            mu: Drift anualizado
-            sigma: Volatilidad anualizada
+            df_rendimientos: DataFrame con rendimientos logarítmicos
 
         Returns:
-            Lista de diccionarios con parámetros por activo
+            Matriz de covarianza anualizada
         """
-        return [
-            {
-                "ticker": nombres[i],
-                "drift_anual": float(mu[i] * 100),
-                "volatilidad_anual": float(sigma[i] * 100)
-            }
-            for i in range(len(nombres))
-        ]
+        return df_rendimientos.cov() * DIAS_TRADING_ANUALES
+
+    def optimizar_cartera(
+        self,
+        df_rendimientos: pd.DataFrame,
+        predicciones_ia: np.ndarray,
+        nombres: List[str]
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        Encuentra los pesos óptimos del portafolio maximizando el Sharpe Ratio.
+        Utiliza scipy.optimize.minimize para optimización determinista.
+
+        Args:
+            df_rendimientos: DataFrame con rendimientos históricos
+            predicciones_ia: Array con rendimientos predichos por LSTM
+            nombres: Lista de nombres/tickers de activos
+
+        Returns:
+            Tuple de (mejor_sharpe_ratio, diccionario_pesos_optimos)
+        """
+        cov_matrix = self.calcular_matriz_covarianza(df_rendimientos).values
+        rend_esperados = predicciones_ia * DIAS_TRADING_ANUALES
+        n_activos = len(nombres)
+
+        def objetivo(weights):
+            retorno_p = np.sum(rend_esperados * weights)
+            vol_p = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+            sharpe = retorno_p / (vol_p + 1e-9)
+            # Para distribución más suave
+            penalizacion_estabilidad = 0.001 * np.sum(weights**2)
+            return -(sharpe - penalizacion_estabilidad)
+
+        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+        bounds = tuple((0.02, 0.45) for _ in range(n_activos))
+        iniciales = np.array([1. / n_activos] * n_activos)
+
+        resultado = minimize(
+            objetivo,
+            iniciales,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints,
+            tol=1e-12
+        )
+
+        pesos_optimos = resultado.x if resultado.success else iniciales
+
+        # Convertir a diccionario
+        pesos_dict = {
+            nombre: float(peso)
+            for nombre, peso in zip(nombres, pesos_optimos)
+        }
+
+        # Calcular Sharpe ratio final
+        retorno_final = np.sum(rend_esperados * pesos_optimos)
+        vol_final = np.sqrt(np.dot(pesos_optimos.T, np.dot(cov_matrix, pesos_optimos)))
+        sharpe_final = retorno_final / (vol_final + 1e-9)
+
+        return sharpe_final, pesos_dict
+
+    def stress_test_monte_carlo(
+        self,
+        precios_simulados: np.ndarray,
+        pesos_optimos: np.ndarray
+    ) -> float:
+        """
+        Calcula el Valor en Riesgo (VaR) 95% de la cartera.
+
+        Args:
+            precios_simulados: Array (dias, rutas, activos) con precios simulados
+            pesos_optimos: Array con pesos de la cartera
+
+        Returns:
+            VaR 95% como porcentaje (ej: -0.05 para pérdida del 5%)
+        """
+        precios_iniciales = precios_simulados[0]
+        precios_finales = precios_simulados[-1]
+
+        # Rendimientos de la cartera total en cada simulación
+        valor_inicial_cartera = np.dot(precios_iniciales, pesos_optimos)
+        valor_final_cartera = np.dot(precios_finales, pesos_optimos)
+        
+        rendimientos_simulados = (valor_final_cartera / valor_inicial_cartera) - 1
+
+        # Cálculo de Valor en Riesgo (VaR) 95%
+        var_95 = np.percentile(rendimientos_simulados, 5)
+
+        return var_95
 
 
 # Instancia singleton del servicio
